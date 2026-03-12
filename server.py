@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import sys
 import time
 from datetime import datetime
@@ -327,7 +328,7 @@ def save_report(tool_type: str, file_paths: list[str], content: str, project_dir
     return str(out_path)
 
 
-def call_chatgpt_responses_api(model: str, system: str, user_msg: str, max_retries: int = 2) -> tuple[str, dict]:
+def call_chatgpt_responses_api(model: str, system: str, user_msg: str, max_retries: int = 3) -> tuple[str, dict]:
     """Call ChatGPT backend Responses API using SSE streaming.
 
     Uses OAuth tokens from ~/.codex/auth.json — billed against ChatGPT
@@ -401,10 +402,12 @@ def call_chatgpt_responses_api(model: str, system: str, user_msg: str, max_retri
                 time.sleep(3)
                 continue
             raise
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, ssl.SSLError, OSError) as e:
             logger.warning(f"Attempt {attempt + 1}/{max_retries + 1} failed: {e}")
             if attempt < max_retries:
-                time.sleep(2)
+                backoff = 3 * (attempt + 1)
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
                 continue
             raise
 
@@ -442,7 +445,7 @@ def call_responses_api(model: str, system: str, user_msg: str, max_retries: int 
                 resp.raise_for_status()
                 data = resp.json()
                 break
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError, ssl.SSLError, OSError) as e:
             last_err = e
             logger.warning(f"Submit attempt {attempt + 1}/{max_retries + 1} failed: {e}")
             if attempt < max_retries:
