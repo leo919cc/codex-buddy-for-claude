@@ -17,7 +17,7 @@ Reports are automatically saved as markdown files to `<project>/codex-reports/`.
 
 ```bash
 # Clone the repo
-git clone https://github.com/claw919/codex-buddy-for-claude.git
+git clone https://github.com/leo919cc/codex-buddy-for-claude.git
 cd codex-buddy-for-claude
 
 # Create venv and install dependencies
