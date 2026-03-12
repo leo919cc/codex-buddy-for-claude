@@ -1,0 +1,14 @@
+[project]
+name = "codex-buddy-for-claude"
+version = "1.0.0"
+description = "MCP server that gives Claude Code access to OpenAI models for code review, deep thinking, and security audits"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "openai>=1.0.0",
+    "httpx>=0.25.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+codex-buddy = "server:main"
