@@ -1,9 +1,12 @@
 """MCP server for OpenAI Codex: code review, deep thinking, and security audit."""
 
+import base64
+import json
 import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,21 +24,123 @@ logger = logging.getLogger("codex-review")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY not found in environment")
-    sys.exit(1)
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 server = Server("codex-review")
 
 MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
 
 # Models that require the Responses API instead of chat completions
-RESPONSES_API_MODELS = {
-    "gpt-5.4", "gpt-5.4-pro",
-    "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5-codex",
-    "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-}
+RESPONSES_API_MODELS = {"gpt-5.4", "gpt-5.4-pro", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max"}
+
+# --- ChatGPT OAuth Backend (uses subscription instead of API tokens) ---
+CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
+CHATGPT_API_URL = "https://chatgpt.com/backend-api/codex/responses"
+OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+TOKEN_REFRESH_SECONDS = 480  # 8 minutes, matching official Codex CLI
+
+
+class OAuthManager:
+    """Manages ChatGPT OAuth tokens from ~/.codex/auth.json."""
+
+    def __init__(self):
+        self.access_token: str | None = None
+        self.refresh_token: str | None = None
+        self.account_id: str | None = None
+        self.expires_at: float = 0
+        self._load()
+
+    def _load(self) -> bool:
+        if not CODEX_AUTH_FILE.exists():
+            logger.info("No Codex auth file at %s", CODEX_AUTH_FILE)
+            return False
+        try:
+            data = json.loads(CODEX_AUTH_FILE.read_text())
+        except Exception as e:
+            logger.warning("Failed to read Codex auth file: %s", e)
+            return False
+        if data.get("auth_mode") != "chatgpt":
+            logger.info("Codex auth mode is '%s', not 'chatgpt'", data.get("auth_mode"))
+            return False
+        tokens = data.get("tokens", {})
+        self.access_token = tokens.get("access_token")
+        self.refresh_token = tokens.get("refresh_token")
+        self.account_id = tokens.get("account_id") or self._account_id_from_jwt(
+            tokens.get("id_token", "")
+        )
+        self.expires_at = time.time() + TOKEN_REFRESH_SECONDS
+        logger.info("Loaded ChatGPT OAuth (account: %s)", self.account_id)
+        return True
+
+    @staticmethod
+    def _account_id_from_jwt(jwt_token: str) -> str | None:
+        try:
+            payload_b64 = jwt_token.split(".")[1]
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+            return claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+        except Exception:
+            return None
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self.access_token and self.account_id)
+
+    def ensure_valid(self) -> None:
+        if time.time() >= self.expires_at:
+            if self.refresh_token:
+                self._refresh()
+            else:
+                self._load()
+
+    def _refresh(self) -> None:
+        logger.info("Refreshing ChatGPT OAuth token")
+        try:
+            with httpx.Client(timeout=30) as http:
+                resp = http.post(
+                    OAUTH_TOKEN_URL,
+                    json={
+                        "client_id": OAUTH_CLIENT_ID,
+                        "grant_type": "refresh_token",
+                        "refresh_token": self.refresh_token,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            logger.warning("Token refresh failed: %s — reloading from disk", e)
+            self._load()
+            return
+        self.access_token = data.get("access_token", self.access_token)
+        self.refresh_token = data.get("refresh_token", self.refresh_token)
+        if data.get("id_token"):
+            self.account_id = self._account_id_from_jwt(data["id_token"]) or self.account_id
+        self.expires_at = time.time() + TOKEN_REFRESH_SECONDS
+        self._save(data)
+        logger.info("OAuth token refreshed successfully")
+
+    def _save(self, new_tokens: dict) -> None:
+        try:
+            auth_data = json.loads(CODEX_AUTH_FILE.read_text())
+            tokens = auth_data.setdefault("tokens", {})
+            for key in ("access_token", "refresh_token", "id_token"):
+                if key in new_tokens:
+                    tokens[key] = new_tokens[key]
+            auth_data["last_refresh"] = datetime.now().isoformat()
+            CODEX_AUTH_FILE.write_text(json.dumps(auth_data, indent=2))
+        except Exception as e:
+            logger.warning("Failed to update auth.json: %s", e)
+
+
+oauth = OAuthManager()
+
+if not oauth.is_available and not OPENAI_API_KEY:
+    logger.error("No auth: need ChatGPT OAuth (~/.codex/auth.json) or OPENAI_API_KEY")
+    sys.exit(1)
+if oauth.is_available:
+    logger.info("Using ChatGPT subscription (no API cost)")
+else:
+    logger.info("Using OpenAI API key (pay-per-token)")
 
 SYSTEM_PROMPT = """\
 ROLE
@@ -183,29 +288,35 @@ def read_files(paths: list[str]) -> str:
 
 def save_report(tool_type: str, file_paths: list[str], content: str, project_dir_override: str = "") -> str:
     """Save report to a markdown file in the project directory. Returns the saved path."""
+    # Use explicit project_dir if provided (most reliable)
     if project_dir_override:
         project_dir = Path(project_dir_override).expanduser()
     else:
+        # Derive project dir from the first file's parent
         first = Path(file_paths[0]).expanduser()
+        # If first path is not a real file (e.g. "thinkdeep"), use cwd instead
         if not first.exists() and not first.is_absolute():
             first = Path.cwd()
         project_dir = first if first.is_dir() else first.parent
-
+    # Walk up to find a git root or stop at Documents
     for parent in [project_dir, *project_dir.parents]:
         if (parent / ".git").exists():
             project_dir = parent
             break
-        if parent.name == "Documents" or parent == parent.parent:
+        if parent.name == "Documents":
             break
 
     reports_dir = project_dir / "codex-reports"
     reports_dir.mkdir(exist_ok=True)
 
+    # Build descriptive filename from source file stems
     stems = [Path(p).stem for p in file_paths]
+    # Truncate to keep filename reasonable
     if len(stems) > 3:
         label = f"{stems[0]}-and-{len(stems)-1}-more"
     else:
         label = "-".join(stems)
+    # Sanitize
     label = re.sub(r"[^a-zA-Z0-9_-]", "", label)[:80]
 
     ts = datetime.now().strftime("%Y%m%d-%H%M")
@@ -216,20 +327,103 @@ def save_report(tool_type: str, file_paths: list[str], content: str, project_dir
     return str(out_path)
 
 
-def call_responses_api(model: str, system: str, user_msg: str, max_retries: int = 2) -> tuple[str, dict]:
-    """Call OpenAI Responses API using background mode to avoid connection timeouts.
+def call_chatgpt_responses_api(model: str, system: str, user_msg: str, max_retries: int = 2) -> tuple[str, dict]:
+    """Call ChatGPT backend Responses API using SSE streaming.
 
-    High-reasoning models can take >180s, which drops synchronous HTTP connections.
-    Background mode submits the request, returns immediately with an ID, then we poll
-    until completion.
+    Uses OAuth tokens from ~/.codex/auth.json — billed against ChatGPT
+    subscription, not API token usage.
     """
-    import time
+    oauth.ensure_valid()
 
+    effort = "xhigh" if "pro" in model else "high"
+    payload = {
+        "model": model,
+        "instructions": system,
+        "input": [{"type": "message", "role": "user", "content": user_msg}],
+        "reasoning": {"effort": effort},
+        "stream": True,
+        "store": False,
+    }
+
+    for attempt in range(max_retries + 1):
+        headers = {
+            "Authorization": f"Bearer {oauth.access_token}",
+            "chatgpt-account-id": oauth.account_id,
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "Content-Type": "application/json",
+            "accept": "text/event-stream",
+        }
+
+        try:
+            final_response = None
+            with httpx.Client(timeout=httpx.Timeout(600, connect=30)) as http:
+                with http.stream("POST", CHATGPT_API_URL, json=payload, headers=headers) as resp:
+                    if resp.status_code == 401 and attempt < max_retries:
+                        logger.warning("Got 401, refreshing OAuth token")
+                        oauth._refresh()
+                        continue
+                    if resp.status_code >= 400:
+                        body = resp.read().decode(errors="replace")
+                        logger.error("HTTP %d from ChatGPT backend: %s", resp.status_code, body[:2000])
+                    resp.raise_for_status()
+
+                    for line in resp.iter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data_str)
+                            if event.get("type") in ("response.done", "response.completed"):
+                                final_response = event.get("response", event)
+                        except json.JSONDecodeError:
+                            continue
+
+            if not final_response:
+                raise RuntimeError("No response.done event received from ChatGPT backend")
+
+            text_parts = []
+            for item in final_response.get("output", []):
+                if item.get("type") == "message":
+                    for content in item.get("content", []):
+                        if content.get("type") == "output_text":
+                            text_parts.append(content["text"])
+            review = "\n".join(text_parts) or "(no output)"
+            usage = final_response.get("usage", {})
+            return review, usage
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.warning("Rate limited (429) — subscription message limit may be reached")
+            if attempt < max_retries:
+                time.sleep(3)
+                continue
+            raise
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as e:
+            logger.warning(f"Attempt {attempt + 1}/{max_retries + 1} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(2)
+                continue
+            raise
+
+    raise RuntimeError("All retries exhausted")
+
+
+def call_responses_api(model: str, system: str, user_msg: str, max_retries: int = 2) -> tuple[str, dict]:
+    """Call OpenAI Responses API using background mode (API key, pay-per-token fallback).
+
+    gpt-5.4 with high reasoning effort can take >180s, which drops synchronous
+    HTTP connections. Background mode submits the request, returns immediately
+    with an ID, then we poll until completion.
+    """
     url = "https://api.openai.com/v1/responses"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
+    # gpt-5.4-pro supports medium/high/xhigh (not low); use xhigh for max depth
     effort = "xhigh" if "pro" in model else "high"
     payload = {
         "model": model,
@@ -239,6 +433,7 @@ def call_responses_api(model: str, system: str, user_msg: str, max_retries: int 
         "background": True,
     }
 
+    # Submit the request (returns immediately with response ID)
     last_err = None
     for attempt in range(max_retries + 1):
         try:
@@ -265,6 +460,7 @@ def call_responses_api(model: str, system: str, user_msg: str, max_retries: int 
 
     logger.info(f"Background response submitted: {response_id}")
 
+    # Poll until completed (max ~10 minutes)
     poll_url = f"{url}/{response_id}"
     max_wait = 600
     poll_interval = 3
@@ -296,6 +492,7 @@ def call_responses_api(model: str, system: str, user_msg: str, max_retries: int 
     if data.get("status") != "completed":
         raise RuntimeError(f"Response timed out after {max_wait}s (status={data.get('status')})")
 
+    # Extract text from output items
     text_parts = []
     for item in data.get("output", []):
         if item.get("type") == "message":
@@ -314,7 +511,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="codex_review",
             description=(
-                "Send code files to OpenAI for expert code review. "
+                "Send code files to OpenAI GPT-5.4 for expert code review. "
                 "Provide absolute file paths and optional focus areas."
             ),
             inputSchema={
@@ -347,7 +544,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="codex_thinkdeep",
             description=(
-                "Send a complex decision or problem to OpenAI for deep analysis. "
+                "Send a complex decision or problem to OpenAI GPT-5.4 for deep analysis. "
                 "For architecture decisions, trade-off evaluation, debugging hypotheses, and strategy. "
                 "Pass model='gpt-5.4-pro' for maximum reasoning depth on the hardest problems."
             ),
@@ -386,7 +583,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="codex_secaudit",
             description=(
-                "Send code files to OpenAI for a thorough security audit. "
+                "Send code files to OpenAI GPT-5.4 for a thorough security audit. "
                 "Covers OWASP Top 10, injection, auth, access control, crypto, data exposure, and more."
             ),
             inputSchema={
@@ -425,12 +622,20 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-def _call_model(model: str, system_prompt: str, user_message: str) -> tuple[str, int, int]:
-    """Call OpenAI with the appropriate API and return (text, in_tokens, out_tokens)."""
-    if model in RESPONSES_API_MODELS or "codex" in model.lower():
+def _call_model(model: str, system_prompt: str, user_message: str) -> tuple[str, int, int, str]:
+    """Call OpenAI with the appropriate API and return (text, in_tokens, out_tokens, auth_method)."""
+    uses_responses = model in RESPONSES_API_MODELS or "codex" in model.lower()
+
+    # Prefer OAuth (subscription, free) over API key (pay-per-token)
+    if uses_responses and oauth.is_available:
+        text, usage = call_chatgpt_responses_api(model, system_prompt, user_message)
+        return text, usage.get("input_tokens", 0), usage.get("output_tokens", 0), "subscription"
+    elif uses_responses:
         text, usage = call_responses_api(model, system_prompt, user_message)
-        return text, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        return text, usage.get("input_tokens", 0), usage.get("output_tokens", 0), "API"
     else:
+        if not client:
+            raise RuntimeError("API key required for non-Responses models but OPENAI_API_KEY not set")
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -443,6 +648,7 @@ def _call_model(model: str, system_prompt: str, user_message: str) -> tuple[str,
             response.choices[0].message.content,
             response.usage.prompt_tokens,
             response.usage.completion_tokens,
+            "API",
         )
 
 
@@ -474,8 +680,8 @@ async def _handle_review(arguments: dict) -> list[TextContent]:
         user_message = f"Context: {context}\n\n{user_message}"
 
     try:
-        text, in_tok, out_tok = _call_model(model, SYSTEM_PROMPT, user_message)
-        footer = f"\n\n---\nModel: {model} | Tokens: {in_tok} in / {out_tok} out"
+        text, in_tok, out_tok, auth = _call_model(model, SYSTEM_PROMPT, user_message)
+        footer = f"\n\n---\nModel: {model} ({auth}) | Tokens: {in_tok} in / {out_tok} out"
         full = text + footer
         report_path = save_report("review", files, full, project_dir)
         full += f"\n\nReport saved: {report_path}"
@@ -505,8 +711,8 @@ async def _handle_thinkdeep(arguments: dict) -> list[TextContent]:
         user_message += f"\n\n## Relevant Code\n{code_content}"
 
     try:
-        text, in_tok, out_tok = _call_model(model, THINKDEEP_PROMPT, user_message)
-        footer = f"\n\n---\nModel: {model} | Tokens: {in_tok} in / {out_tok} out"
+        text, in_tok, out_tok, auth = _call_model(model, THINKDEEP_PROMPT, user_message)
+        footer = f"\n\n---\nModel: {model} ({auth}) | Tokens: {in_tok} in / {out_tok} out"
         full = text + footer
         source_files = files if files else ["thinkdeep"]
         report_path = save_report("thinkdeep", source_files, full, project_dir)
@@ -544,8 +750,8 @@ async def _handle_secaudit(arguments: dict) -> list[TextContent]:
         user_message = f"Context: {context}\n\n{user_message}"
 
     try:
-        text, in_tok, out_tok = _call_model(model, SECAUDIT_PROMPT, user_message)
-        footer = f"\n\n---\nModel: {model} | Tokens: {in_tok} in / {out_tok} out"
+        text, in_tok, out_tok, auth = _call_model(model, SECAUDIT_PROMPT, user_message)
+        footer = f"\n\n---\nModel: {model} ({auth}) | Tokens: {in_tok} in / {out_tok} out"
         full = text + footer
         report_path = save_report("secaudit", files, full, project_dir)
         full += f"\n\nReport saved: {report_path}"

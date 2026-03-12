@@ -11,7 +11,7 @@ Reports are automatically saved as markdown files to `<project>/codex-reports/`.
 ## Requirements
 
 - Python 3.10+
-- An [OpenAI API key](https://platform.openai.com/api-keys)
+- **Either** an [OpenAI API key](https://platform.openai.com/api-keys) (pay-per-token) **or** a [ChatGPT Plus/Pro subscription](https://chatgpt.com/pricing) (flat monthly fee)
 
 ## Install
 
@@ -24,20 +24,6 @@ cd codex-buddy-for-claude
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Configure your API key
-
-Create a `.env` file in the repo directory:
-
-```bash
-echo "OPENAI_API_KEY=sk-your-key-here" > .env
-```
-
-Or export it in your shell:
-
-```bash
-export OPENAI_API_KEY=sk-your-key-here
 ```
 
 ## Add to Claude Code
@@ -62,18 +48,54 @@ Then restart Claude Code. You should see the three tools available:
 - `mcp__codexreview__codex_thinkdeep`
 - `mcp__codexreview__codex_secaudit`
 
+## Authentication
+
+The server supports two auth methods. It prefers OAuth (free with subscription) and falls back to API key (pay-per-token).
+
+### Option A: ChatGPT subscription (recommended)
+
+Use your ChatGPT Plus ($20/mo) or Pro ($200/mo) subscription — no per-token API costs.
+
+```bash
+# Install Codex CLI and login (one-time)
+npm install -g @openai/codex
+codex login
+```
+
+This saves OAuth tokens to `~/.codex/auth.json`. The MCP server auto-detects them on startup. The report footer will show `(subscription)` to confirm.
+
+### Option B: API key (pay-per-token)
+
+Create a `.env` file in the repo directory:
+
+```bash
+echo "OPENAI_API_KEY=sk-your-key-here" > .env
+```
+
+Or export it in your shell:
+
+```bash
+export OPENAI_API_KEY=sk-your-key-here
+```
+
+The report footer will show `(API)` when using this method.
+
+### Both configured?
+
+If both OAuth and API key are available, OAuth is used by default (free). The API key serves as fallback if OAuth tokens expire or fail.
+
 ## Configuration
 
 | Env Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | (required) | Your OpenAI API key |
+| `OPENAI_API_KEY` | (optional if using OAuth) | Your OpenAI API key |
 | `CODEX_MODEL` | `gpt-5.4` | Default model for all tools |
 
 You can also override the model per-call by passing the `model` parameter to any tool.
 
 ### Supported models
 
-Any OpenAI model works. High-reasoning models (codex/5.x series) automatically use the Responses API with background polling to handle long-running requests:
+Any OpenAI model works. High-reasoning models (codex/5.x series) automatically use the Responses API:
 
 - `gpt-5.4` (default) — high reasoning
 - `gpt-5.4-pro` — xhigh reasoning (premium pricing)
